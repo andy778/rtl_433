@@ -381,7 +381,7 @@ See [CONTRIBUTING.md](./docs/CONTRIBUTING.md).
     [291]  Geevon TX19-1 outdoor sensor
     [292]  WallarGe CLTX001 Outdoor Temperature Sensor
     [293]  Sainlogic SA8, Gevanti SA8 Weather Station
-    [294]  ThermoPro TP862b TempSpike XR Wireless Dual-Probe Meat Thermometer
+    [294]  ThermoPro TempSpike XR TP862b / TP863b Wireless Dual-Probe Meat Thermometer
     [295]  Airpuxem TPMS TYH11_EU6_ZQ
     [296]  Apator Metra E-ITN 30 heat cost allocator
     [297]  ThermoPro TP211B Thermometer
@@ -408,6 +408,7 @@ See [CONTRIBUTING.md](./docs/CONTRIBUTING.md).
     [318]  RFM69 LowPowerLab Moteino board (-s 1000k)
     [319]  Shenzhen Wale WL-TH6R Temperature & Humidity Sensor
     [320]  Cellular Tracking Technologies LifeTag/PowerTag/HybridTag
+    [321]  Schrader Motorcycle TPMS sensor
 
 * Disabled by default, use -R n or a conf file to enable
 

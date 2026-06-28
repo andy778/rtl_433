@@ -301,7 +301,7 @@
     DECL(geevon_tx19) \
     DECL(wallarge_cltx001) \
     DECL(sainlogic_sa8) \
-    DECL(thermopro_tp862b) \
+    DECL(thermopro_tp86xb) \
     DECL(tpms_airpuxem) \
     DECL(apator_metra_eitn30) \
     DECL(thermopro_tp211b) \
@@ -329,6 +329,7 @@
     DECL(shenzhen_wale_wl_th6r) \
     DECL(ctt_life_power_hybrid) \
     DECL(alutech_at_4n) \
+    DECL(tpms_schrader_motorcycle) \
     /* Add new decoders here. */
 
 #define DECL(name) extern r_device name;

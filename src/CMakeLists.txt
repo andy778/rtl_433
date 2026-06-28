@@ -38,6 +38,7 @@ add_library(r_433 STATIC
     pulse_slicer.c
     r_api.c
     r_util.c
+    r_version.c
     raw_output.c
     rfraw.c
     samp_grab.c
@@ -277,7 +278,7 @@ add_library(r_433 STATIC
     devices/thermopro_tp211b.c
     devices/thermopro_tp28b.c
     devices/thermopro_tp82xb.c
-    devices/thermopro_tp862b.c
+    devices/thermopro_tp86xb.c
     devices/thermopro_tx2.c
     devices/thermopro_tx2c.c
     devices/thermopro_tx7b.c
@@ -301,6 +302,7 @@ add_library(r_433 STATIC
     devices/tpms_porsche.c
     devices/tpms_renault.c
     devices/tpms_renault_0435r.c
+    devices/tpms_schrader_motorcycle.c
     devices/tpms_toyota.c
     devices/tpms_truck.c
     devices/tpms_trw.c
