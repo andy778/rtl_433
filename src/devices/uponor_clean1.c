@@ -70,14 +70,25 @@ STILL UNKNOWN (do not invent)
        docs/rtl433.md "0d"). Whether that header **is** the 4-byte address
        (EAEAEAEA) at some bit offset, residual preamble, or something else has
        NOT been checked bit-for-bit - do not assume either way.
-  [U4] Confirmed: nRF905 hardware CRC-16 exists but is not in the decoded stream
-       (see above). Separately, section "0d" in docs/rtl433.md found the
-       payload's 2-byte trailer is content-dependent but matches NO standard
-       CRC-8/16/sum/Fletcher/Adler under exhaustive search - still open, likely
-       a proprietary/nonlinear check computed on the MC9S08 side (candidate
-       code: the B-prefixed routine chain reached from FUN_a77b, i.e.
-       FUN_b218/FUN_b3d0/FUN_b328/FUN_b378/FUN_b865, which takes RAM 0x0109/
-       0x010b as inputs - not yet decompiled/verified).
+  [U4] There are two CRC-16s, and the trailer IS a CRC after all:
+       1. nRF905 hardware CRC-16 over the pre-Manchester on-air address+payload
+          (config CRC_EN=1/CRC_MODE=1). Verified + stripped by the radio, so not
+          in the decoded stream - nothing to check here.
+       2. The 2-byte payload trailer that section "0d" of docs/rtl433.md could
+          not match to any standard CRC. The MC9S08 firmware settles it: the
+          frame serializer FUN_ce01 computes CRC-16/CCITT-FALSE (poly 0x1021,
+          init 0xFFFF, MSB-first, no reflection, no xorout, transmitted
+          big-endian) via a nibble-table update (FUN_e0cd -> FUN_e08e; the two
+          16-entry tables at flash 0x8b14/0x8b24 match the 0x1021 nibble table
+          exactly) over the MC9S08's *message* bytes, and appends it.
+          It did NOT match in "0d" because that search ran over the
+          Manchester-decoded ON-AIR bytes, which are a further-encoded form of
+          the message - the covered byte range and the on-air<->message
+          transform are the same open question as [U5]. So the algorithm is
+          fully known; verifying/using it in this decoder needs the
+          on-air->message byte mapping resolved first.
+          (An earlier guess that the FUN_b218/b3d0/... chain computed this was
+          WRONG - that chain is the LCD menu renderer.)
   [U6] field semantics: which decoded byte is water level / temperature / phase /
        alarm code / pump state. Two things are now confirmed from the MC9S08
        side that narrow this down (see docs/rtl433.md "0b"):
