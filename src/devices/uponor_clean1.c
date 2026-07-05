@@ -28,9 +28,12 @@ CONFIRMED from captures
 -----------------------
 - Modulation: FSK, deviation ~+-38 kHz.
 - LINE RATE : 100 kbps (10 us/bit), NOT the nRF905 50 kbps default.
-- CODING    : the payload is MANCHESTER-encoded. Raw 100 kbps line => ~50 kbps
-              of Manchester data, ~40 bytes/packet.
-              Convention observed: raw "01" -> 1, raw "10" -> 0.
+- CODING    : the raw 100 kbps line Manchester-DECODES cleanly (~3-4% illegal
+              pairs, vs ~50% for random NRZ) with convention raw "01" -> 1,
+              "10" -> 0, giving ~50 kbps / ~40 bytes/packet. BUT see the caveat
+              below: neither firmware image applies a software Manchester step,
+              so whether this is true Manchester line-coding or an artifact of
+              the byte patterns is now in question ([U5]).
 - FRAMING   : each transmit event (every ~62 s) is a TWO-packet exchange -
               packet A (~6.2 ms) then a ~19 ms gap then packet B (~6.6 ms), with
               very different RSSI = the near/far units answering each other.
@@ -65,11 +68,24 @@ extracted image; see docs/nrf9e5-firmware.md)
 
 STILL UNKNOWN (do not invent)
 -----------------------------
-  [U5] Reconcile the 32-byte nRF905 payload width with what's actually observed:
-       captures show ~33 bytes after the 6-byte "fd7a bababa 83" header (see
-       docs/rtl433.md "0d"). Whether that header **is** the 4-byte address
-       (EAEAEAEA) at some bit offset, residual preamble, or something else has
-       NOT been checked bit-for-bit - do not assume either way.
+  [U5] The on-air<->message transform is the key open question, and it just got
+       more interesting. Tracing BOTH firmware images end to end:
+       - MC9S08 side: the frame serializer FUN_ce01 appends message bytes RAW to
+         a 128-byte ring buffer (FUN_8ec7: STA 0x0253,X, index 0x0251 & 0x7f) -
+         no XOR/shift/expand, no Manchester.
+       - nRF9E5 side: the 8051 relays those bytes verbatim into the nRF905
+         W_TX_PAYLOAD (see docs/nrf9e5-firmware.md) - also no Manchester.
+       So NEITHER firmware does a software Manchester step, yet the on-air line
+       Manchester-decodes cleanly. That is not reconciled. Possibilities, none
+       confirmed: (a) the nRF905 payload really is the raw 32 message bytes sent
+       via ShockBurst (preamble + EAEAEAEA address + 32B payload + hw CRC-16),
+       and the "Manchester" the flex decoder finds is a coincidence of the byte
+       patterns; (b) a transform happens in the SPI hand-off path not yet traced;
+       (c) the radio runs in a non-ShockBurst mode. The decisive test: take a RAW
+       capture (FSK_PCM, pre-Manchester) and try to parse it as native nRF905
+       ShockBurst (address EAEAEAEA, 32B payload) WITHOUT Manchester, then check
+       the trailing bytes as the hw CRC-16 and the in-payload CRC-16/CCITT ([U4]).
+       Do NOT assume the current Manchester model is correct until that is done.
   [U4] There are two CRC-16s, and the trailer IS a CRC after all:
        1. nRF905 hardware CRC-16 over the pre-Manchester on-air address+payload
           (config CRC_EN=1/CRC_MODE=1). Verified + stripped by the radio, so not
