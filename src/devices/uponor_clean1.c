@@ -53,12 +53,16 @@ extracted image; see docs/nrf9e5-firmware.md)
               carrier - an independent cross-check that this is the right image.
 - ADDRESS   : 4 bytes, RX and TX address both EAEAEAEA (W_TX_ADDRESS).
 - PAYLOAD   : nRF905 RX_PW/TX_PW = 32 bytes (hardware payload width register).
-- CRC       : CRC_EN=1, CRC_MODE=1 -> 16-bit, computed by the nRF905 hardware
-              over the pre-Manchester on-air bits. It is verified/stripped by
-              the radio itself and is NOT present in the Manchester-decoded
-              stream handed to this decoder - there is nothing to check here.
-              (A separate, non-CRC application trailer inside the payload is
-              still unresolved - see [U4] below.)
+- CRC       : CRC_EN=1, CRC_MODE=1 -> 16-bit (poly 0x1021, init 0xFFFF, over
+              ADDRESS+PAYLOAD). CONFIRMED on-air, not just from the datasheet:
+              tools/rtl433/probe_capture.py FM-discriminates a real capture,
+              Manchester-decodes it, finds the firmware address EA EA EA EA, and
+              the trailing CRC-16 VERIFIES (g001_868.2M_1000k.cu8, burst1 ->
+              CRC-16 PASS). So the frame is [preamble][EA EA EA EA][32B payload]
+              [CRC-16], and the address / 32-byte width / CRC are all confirmed
+              from the air. (A separate in-payload application check may also
+              exist - the MC9S08 CRC-16/CCITT of [U4] - but it was not needed to
+              validate the frame.)
 - RELAY     : the 8051 does not compute payload content. Tracing its serial ISR
               (0x029f) shows the MC9S08 sends a length byte (0x01-0x1f) + that
               many payload bytes, which the 8051 copies verbatim into the radio
@@ -68,24 +72,24 @@ extracted image; see docs/nrf9e5-firmware.md)
 
 STILL UNKNOWN (do not invent)
 -----------------------------
-  [U5] The on-air<->message transform is the key open question, and it just got
-       more interesting. Tracing BOTH firmware images end to end:
-       - MC9S08 side: the frame serializer FUN_ce01 appends message bytes RAW to
-         a 128-byte ring buffer (FUN_8ec7: STA 0x0253,X, index 0x0251 & 0x7f) -
-         no XOR/shift/expand, no Manchester.
-       - nRF9E5 side: the 8051 relays those bytes verbatim into the nRF905
-         W_TX_PAYLOAD (see docs/nrf9e5-firmware.md) - also no Manchester.
-       So NEITHER firmware does a software Manchester step, yet the on-air line
-       Manchester-decodes cleanly. That is not reconciled. Possibilities, none
-       confirmed: (a) the nRF905 payload really is the raw 32 message bytes sent
-       via ShockBurst (preamble + EAEAEAEA address + 32B payload + hw CRC-16),
-       and the "Manchester" the flex decoder finds is a coincidence of the byte
-       patterns; (b) a transform happens in the SPI hand-off path not yet traced;
-       (c) the radio runs in a non-ShockBurst mode. The decisive test: take a RAW
-       capture (FSK_PCM, pre-Manchester) and try to parse it as native nRF905
-       ShockBurst (address EAEAEAEA, 32B payload) WITHOUT Manchester, then check
-       the trailing bytes as the hw CRC-16 and the in-payload CRC-16/CCITT ([U4]).
-       Do NOT assume the current Manchester model is correct until that is done.
+  [U5] RESOLVED (frame structure). The decisive test was run
+       (tools/rtl433/probe_capture.py on g001_868.2M_1000k.cu8): the on-air line
+       IS Manchester (confirmed, ~3% illegal pairs), and after decoding, the
+       frame is [preamble][EA EA EA EA address][32-byte payload][CRC-16], with the
+       hw CRC-16 verifying. So Manchester coding + the 4-byte EAEAEAEA address +
+       32-byte payload width are all confirmed from a real capture. (The firmware
+       does no *software* Manchester - MC9S08 FUN_ce01/FUN_8ec7 append raw bytes
+       to a ring buffer at RAM 0x0253, and the 8051 relays them verbatim - so the
+       Manchester is a radio/PHY-layer effect, not a firmware step.)
+       IMPLEMENTATION CAVEAT (why the decode logic below is NOT yet changed): the
+       framework's FSK_MC_ZEROBIT slicer presents the bits in a different
+       bit-order/alignment than probe_capture.py's FM-discriminator decode - e.g.
+       one packet shows the address as 0x57 0x57 0x57 0x57 (= bit-reversed 0xEA)
+       at a byte boundary, while the other still prints the old fd7a...83 anchor.
+       Reconciling that bit convention (so the C decoder can anchor on the address
+       and CRC-16-gate in the bitbuffer domain) is a focused follow-up; until it
+       is done and tested end-to-end in rtl_433, the decoder keeps the working
+       fd7a anchor and emits raw hex.
   [U4] There are two CRC-16s, and the trailer IS a CRC after all:
        1. nRF905 hardware CRC-16 over the pre-Manchester on-air address+payload
           (config CRC_EN=1/CRC_MODE=1). Verified + stripped by the radio, so not
