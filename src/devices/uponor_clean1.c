@@ -136,9 +136,12 @@ STILL UNKNOWN (do not invent)
        capture: change the level / force an alarm and watch which decoded
        payload byte moves.
 
-Because [U5]/[U6] are open, this decoder emits the constant header plus the raw
-Manchester-decoded payload as a hex string, so captures can be correlated with
-the display. It ships disabled until the fields and CRC are pinned down.
+This decoder anchors on the address, CRC-16-gates every frame, and emits the
+CRC-validated 32-byte payload as hex (field semantics [U6] not yet mapped, so
+the raw payload is still what captures are correlated against). It is ENABLED:
+tested end-to-end in rtl_433 on g001_868.2M_1000k.cu8, both packets of the
+exchange decode with mic=CRC, and an unrelated 433 MHz capture produces no
+false positives.
 
 Flex-decoder equivalent for a first capture pass. Tune ~150 kHz low so the
 carrier lands off the RTL-SDR DC spike; -Y minmax selects the FSK peak detector
@@ -169,15 +172,16 @@ To instead see the RAW on-air bits (Manchester still encoded, decode by eye
 // ZEROBIT slicer uses short==long==10 us.
 #define UCLEAN1_BIT_US 10
 
-// Manchester-decoded header anchor (see notes above): fd 7a precedes the packet.
-static uint8_t const uclean1_sync[] = {0xfd, 0x7a};
+// Frame anchor = the nRF905 4-byte address EA EA EA EA (from firmware; confirmed
+// on-air, see the file header). In the Manchester-decoded stream the frame is
+// [ADDRESS 4][PAYLOAD 32][CRC-16 2]; the CRC-16 (poly 0x1021, init 0xFFFF over
+// ADDRESS+PAYLOAD) verifies on real captures, so it gates the decode.
+static uint8_t const uclean1_addr[] = {0xea, 0xea, 0xea, 0xea};
 
-// Conservative bounds on the Manchester-decoded packet (bytes). The firmware's
-// nRF905 config says the true payload is 32 bytes (see the file header), but
-// that is not yet reconciled with the observed ~33-36 bytes after this 6-byte
-// header ([U5]), so the bounds here stay loose rather than hard-coding 32.
-#define UCLEAN1_MIN_BYTES 20
-#define UCLEAN1_MAX_BYTES 64
+#define UCLEAN1_ADDR_LEN     4
+#define UCLEAN1_PAYLOAD_LEN  32
+#define UCLEAN1_CRC_LEN      2
+#define UCLEAN1_FRAME_LEN    (UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + UCLEAN1_CRC_LEN) // 38
 
 static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
@@ -186,66 +190,73 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
     for (unsigned row = 0; row < bitbuffer->num_rows; ++row) {
         unsigned row_bits = bitbuffer->bits_per_row[row];
 
-        // FSK_PULSE_MANCHESTER_ZEROBIT already Manchester-decoded the row, so a
-        // packet is header(6) + ~30 payload bytes of DECODED data.
-        if (row_bits < UCLEAN1_MIN_BYTES * 8) {
+        // FSK_PULSE_MANCHESTER_ZEROBIT already Manchester-decoded the row.
+        if (row_bits < UCLEAN1_FRAME_LEN * 8) {
             ret = DECODE_ABORT_LENGTH;
             continue;
         }
 
-        // The ZEROBIT slicer phase-locks on a leading zero bit, so the fd 7a
-        // anchor can land at any bit offset - search for it. Its output polarity
-        // depends on which Manchester convention matched, so if the anchor is not
-        // found, invert the whole buffer and try once more (then restore).
+        // The ZEROBIT slicer phase-locks on a leading zero bit, so the address
+        // anchor can land at any bit offset - bitbuffer_search finds it. Its
+        // output polarity depends on which Manchester convention matched, so if
+        // the anchor is not found, invert the whole buffer and try once more.
         unsigned pos = bitbuffer_search(bitbuffer, row, 0,
-                uclean1_sync, sizeof(uclean1_sync) * 8);
+                uclean1_addr, sizeof(uclean1_addr) * 8);
         int inverted = 0;
         if (pos >= row_bits) {
             bitbuffer_invert(bitbuffer);
             inverted = 1;
             pos = bitbuffer_search(bitbuffer, row, 0,
-                    uclean1_sync, sizeof(uclean1_sync) * 8);
+                    uclean1_addr, sizeof(uclean1_addr) * 8);
         }
         if (pos >= row_bits) {
             if (inverted)
                 bitbuffer_invert(bitbuffer); // restore for the next row
-            decoder_log(decoder, 2, __func__, "sync fd7a not found");
+            decoder_log(decoder, 2, __func__, "address EAEAEAEA not found");
             ret = DECODE_ABORT_EARLY;
             continue;
         }
 
-        // Header = fd 7a ba ba ba 83  (6 bytes = 48 bits); payload follows.
-        if (pos + (6 + UCLEAN1_MIN_BYTES) * 8 > row_bits) {
+        if (pos + UCLEAN1_FRAME_LEN * 8 > row_bits) {
             if (inverted)
                 bitbuffer_invert(bitbuffer);
             ret = DECODE_ABORT_LENGTH;
             continue;
         }
 
-        // Byte-align header + payload from the anchor. Extract what we have.
-        unsigned avail_bytes = (row_bits - pos) / 8;
-        if (avail_bytes > UCLEAN1_MAX_BYTES)
-            avail_bytes = UCLEAN1_MAX_BYTES;
-        uint8_t frame[UCLEAN1_MAX_BYTES] = {0};
-        bitbuffer_extract_bytes(bitbuffer, row, pos, frame, avail_bytes * 8);
+        uint8_t frame[UCLEAN1_FRAME_LEN] = {0};
+        bitbuffer_extract_bytes(bitbuffer, row, pos, frame, UCLEAN1_FRAME_LEN * 8);
 
-        // frame[0..5] = header, frame[6..] = payload.
-        unsigned payload_len = avail_bytes - 6;
+        if (inverted)
+            bitbuffer_invert(bitbuffer); // restore for the next row
 
-        char header_str[6 * 2 + 1];
-        for (unsigned i = 0; i < 6; ++i)
-            snprintf(header_str + i * 2, 3, "%02x", frame[i]);
+        // nRF905 hardware CRC-16 over ADDRESS+PAYLOAD (poly 0x1021, init 0xFFFF),
+        // trailing big-endian. Gates the decode.
+        uint16_t crc_calc = crc16(frame, UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN, 0x1021, 0xffff);
+        uint16_t crc_recv = (frame[UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN] << 8)
+                | frame[UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + 1];
+        if (crc_calc != crc_recv) {
+            decoder_log(decoder, 2, __func__, "CRC-16 mismatch");
+            ret = DECODE_FAIL_MIC;
+            continue;
+        }
 
-        char payload_str[UCLEAN1_MAX_BYTES * 2 + 1];
-        for (unsigned i = 0; i < payload_len; ++i)
-            snprintf(payload_str + i * 2, 3, "%02x", frame[6 + i]);
+        char id_str[UCLEAN1_ADDR_LEN * 2 + 1];
+        for (unsigned i = 0; i < UCLEAN1_ADDR_LEN; ++i)
+            snprintf(id_str + i * 2, 3, "%02x", frame[i]);
+
+        // Payload byte semantics ([U6]) are not yet mapped, so emit the raw
+        // CRC-validated 32-byte payload as hex for correlation with the display.
+        char payload_str[UCLEAN1_PAYLOAD_LEN * 2 + 1];
+        for (unsigned i = 0; i < UCLEAN1_PAYLOAD_LEN; ++i)
+            snprintf(payload_str + i * 2, 3, "%02x", frame[UCLEAN1_ADDR_LEN + i]);
 
         /* clang-format off */
         data_t *data = data_make(
                 "model",        "",             DATA_STRING, "Uponor-Clean-1",
-                "header",       "Header",       DATA_STRING, header_str,
+                "id",           "Address",      DATA_STRING, id_str,
                 "payload",      "Payload",      DATA_STRING, payload_str,
-                "payload_len",  "Payload bytes",DATA_INT,    (int)payload_len,
+                "mic",          "Integrity",    DATA_STRING, "CRC",
                 NULL);
         /* clang-format on */
         decoder_output_data(decoder, data);
@@ -257,9 +268,9 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
 static char const *const uponor_clean1_output_fields[] = {
         "model",
-        "header",
+        "id",
         "payload",
-        "payload_len",
+        "mic",
         // Real sensor fields go here once [U6] is resolved, e.g.:
         // "level_pct", "temperature_C", "phase", "alarm", "pump_on",
         NULL,
@@ -278,6 +289,9 @@ r_device const uponor_clean1 = {
         .long_width  = UCLEAN1_BIT_US,
         .reset_limit = 100,
         .decode_fn   = &uponor_clean1_decode,
-        .disabled    = 1,   // keep disabled until CRC + fields are validated
+        // CRC-16 now gates every frame (address + hw CRC verified on real
+        // captures), so enabled. Payload field semantics ([U6]) are still raw
+        // hex, but the CRC prevents false positives.
+        .disabled    = 0,
         .fields      = uponor_clean1_output_fields,
 };
