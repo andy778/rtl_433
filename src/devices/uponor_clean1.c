@@ -13,180 +13,71 @@
 Uponor Clean 1 - inner/outer unit radio link.
 
 The Clean 1 links the outer (tank) unit and the inner (indoor display) unit.
-U1 on the PCB is a Nordic nRF9E5 (nRF905 transceiver + 8051 MCU). The radio PHY
-is nRF905: GFSK, 868 MHz band.
+U1 is a Nordic nRF9E5 (nRF905 transceiver + 8051 MCU). There is no external
+boot chip for the 8051 - its firmware is embedded in the MC9S08 (U2) flash
+(dumps/u2-mc9s08gt-flash.bin), served over SPI at boot, and was extracted +
+disassembled (dumps/u1-nrf9e5-8051.bin). See project docs/nrf9e5-firmware.md
+and docs/rtl433-decoder.md (github.com/andy778/UClean1) for the full derivation;
+this comment covers only what a maintainer needs to trust the decoder.
 
-Two independent evidence sources agree here, which is why the numbers below are
-trusted: (a) real RTL-SDR captures (see docs/rtl433.md, "Empirical results"), and
-(b) the nRF9E5's own 8051 firmware. That firmware is NOT on a separate chip -
-there is no boot EEPROM on this board. U1's SPI lines run to U2 (the MC9S08),
-which serves the 8051 its boot image, so the 8051 program is embedded in
-dumps/u2-mc9s08gt-flash.bin (see docs/nrf9e5-firmware.md) and was extracted +
-disassembled (dumps/u1-nrf9e5-8051.bin).
+Frame, confirmed both from the 8051's nRF905 W_CONFIG write and from a real
+capture (tools/rtl433/probe_capture.py: Manchester-decodes, finds the address,
+CRC-16 passes):
 
-CONFIRMED from captures
------------------------
-- Modulation: FSK, deviation ~+-38 kHz.
-- LINE RATE : 100 kbps (10 us/bit), NOT the nRF905 50 kbps default.
-- CODING    : the raw 100 kbps line Manchester-DECODES cleanly (~3-4% illegal
-              pairs, vs ~50% for random NRZ) with convention raw "01" -> 1,
-              "10" -> 0, giving ~50 kbps / ~40 bytes/packet. BUT see the caveat
-              below: neither firmware image applies a software Manchester step,
-              so whether this is true Manchester line-coding or an artifact of
-              the byte patterns is now in question ([U5]).
-- FRAMING   : each transmit event (every ~62 s) is a TWO-packet exchange -
-              packet A (~6.2 ms) then a ~19 ms gap then packet B (~6.6 ms), with
-              very different RSSI = the near/far units answering each other.
-- SYNC/HDR  : after a repeating 0xBA run, every Manchester-decoded packet begins
-              with a constant header:  fd 7a  ba ba ba  83  <payload...>.
-              The 0xfd 0x7a pair is used here as the frame anchor.
-- PAYLOAD   : ~30 bytes after the header. Across consecutive events the payload
-              is near-static (3 of 4 events were byte-identical), i.e. it is
-              slowly-changing telemetry, not a counter/nonce. A ~1.5 h idle log
-              additionally showed the response frame is 100% static and the poll
-              frame is a doubled 13-byte record (see docs/rtl433.md "0d").
+    [preamble] [address: EA EA EA EA, 4B] [payload: 32B] [CRC-16: 2B]
 
-CONFIRMED from the 8051 firmware (W_CONFIG write, routine 0x015c in the
-extracted image; see docs/nrf9e5-firmware.md)
------------------------------------------------------------------------
-- CHANNEL   : CH_NO=117, HFREQ_PLL=1 -> f = 868.2 MHz. Matches the measured
-              carrier - an independent cross-check that this is the right image.
-- ADDRESS   : 4 bytes, RX and TX address both EAEAEAEA (W_TX_ADDRESS).
-- PAYLOAD   : nRF905 RX_PW/TX_PW = 32 bytes (hardware payload width register).
-- CRC       : CRC_EN=1, CRC_MODE=1 -> 16-bit (poly 0x1021, init 0xFFFF, over
-              ADDRESS+PAYLOAD). CONFIRMED on-air, not just from the datasheet:
-              tools/rtl433/probe_capture.py FM-discriminates a real capture,
-              Manchester-decodes it, finds the firmware address EA EA EA EA, and
-              the trailing CRC-16 VERIFIES (g001_868.2M_1000k.cu8, burst1 ->
-              CRC-16 PASS). So the frame is [preamble][EA EA EA EA][32B payload]
-              [CRC-16], and the address / 32-byte width / CRC are all confirmed
-              from the air. (A separate in-payload application check may also
-              exist - the MC9S08 CRC-16/CCITT of [U4] - but it was not needed to
-              validate the frame.)
-- RELAY     : the 8051 does not compute payload content. Tracing its serial ISR
-              (0x029f) shows the MC9S08 sends a length byte (0x01-0x1f) + that
-              many payload bytes, which the 8051 copies verbatim into the radio
-              TX buffer (RAM 0x30-0x4F) and transmits; inbound data is relayed
-              back the same way. So every payload byte is defined by the
-              MC9S08 firmware, not the 8051.
+- Line rate 100 kbps, Manchester-coded on air (neither firmware applies
+  Manchester in software - MC9S08 FUN_ce01/FUN_8ec7 and the 8051 relay both
+  copy bytes raw, so this is a radio/PHY-layer effect).
+- Channel 117 / 868.2 MHz (matches the measured carrier).
+- CRC-16: poly 0x1021, init 0xFFFF, over address+payload, big-endian trailer.
+  Verified live in this decoder (mic=CRC) and via probe_capture.py.
+- The 8051 never computes payload content - it relays whatever the MC9S08
+  sends it byte-for-byte (traced via the 8051's serial ISR at 0x029f).
 
-STILL UNKNOWN (do not invent)
------------------------------
-  [U5] RESOLVED (frame structure). The decisive test was run
-       (tools/rtl433/probe_capture.py on g001_868.2M_1000k.cu8): the on-air line
-       IS Manchester (confirmed, ~3% illegal pairs), and after decoding, the
-       frame is [preamble][EA EA EA EA address][32-byte payload][CRC-16], with the
-       hw CRC-16 verifying. So Manchester coding + the 4-byte EAEAEAEA address +
-       32-byte payload width are all confirmed from a real capture. (The firmware
-       does no *software* Manchester - MC9S08 FUN_ce01/FUN_8ec7 append raw bytes
-       to a ring buffer at RAM 0x0253, and the 8051 relays them verbatim - so the
-       Manchester is a radio/PHY-layer effect, not a firmware step.)
-       RESOLVED (implementation): rtl_433's own FSK_MC_ZEROBIT output was
-       reconciled against probe_capture.py's independent decode - both find
-       EAEAEAEA and pass CRC-16 on the SAME two captured packets, just at a
-       per-packet bit offset that bitbuffer_search already handles. The decoder
-       below anchors on the address and CRC-16-gates every frame; both packets
-       of g001_868.2M_1000k.cu8 decode with mic=CRC.
-  [U4] There are two CRC-16s, and the trailer IS a CRC after all:
-       1. nRF905 hardware CRC-16 over the pre-Manchester on-air address+payload
-          (config CRC_EN=1/CRC_MODE=1). Verified + stripped by the radio, so not
-          in the decoded stream - nothing to check here.
-       2. The 2-byte payload trailer that section "0d" of docs/rtl433.md could
-          not match to any standard CRC. The MC9S08 firmware settles it: the
-          frame serializer FUN_ce01 computes CRC-16/CCITT-FALSE (poly 0x1021,
-          init 0xFFFF, MSB-first, no reflection, no xorout, transmitted
-          big-endian) via a nibble-table update (FUN_e0cd -> FUN_e08e; the two
-          16-entry tables at flash 0x8b14/0x8b24 match the 0x1021 nibble table
-          exactly) over the MC9S08's *message* bytes, and appends it.
-          It did NOT match in "0d" because that search ran over the
-          Manchester-decoded ON-AIR bytes, which are a further-encoded form of
-          the message - the covered byte range and the on-air<->message
-          transform are the same open question as [U5]. So the algorithm is
-          fully known; verifying/using it in this decoder needs the
-          on-air->message byte mapping resolved first.
-          (An earlier guess that the FUN_b218/b3d0/... chain computed this was
-          WRONG - that chain is the LCD menu renderer.)
-  [U6] field semantics: which decoded byte is water level / temperature / phase /
-       alarm code / pump state. Two things are now confirmed from the MC9S08
-       side that narrow this down (see docs/rtl433.md "0b"):
-       - The satsraknare (CYCLE COUNTER) lives in MC9S08 RAM 0x0607, and the
-         PLANT STATUS S-code is built from RAM 0x0613/0x0614 - NEITHER is among
-         the four 16-bit words (RAM 0x013e/0x0140/0x0109/0x010b) that get
-         radio'd out via FUN_db22/FUN_de1b. This matches the empirical finding
-         that the counter never appears on air (a ~20 h capture spanning a real
-         counter tick showed byte-identical heartbeat frames) - don't look for
-         it in the radio payload.
-       - Those four RAM words behave structurally like a poll/ack correlation
-         pair, not raw sensor telemetry: FUN_caee (the response handler) checks
-         the INCOMING frame's corresponding fields for equality against them
-         (_DAT_0109==_DAT_0619, _DAT_010b==_DAT_061b, _DAT_013e==_DAT_061d,
-         _DAT_0140==_DAT_061f) before accepting the reply.
-       - BYTE OFFSETS NOW LOCATED (verified against real captures). Reading the
-         raw HCS08 assembly of the frame serializer FUN_ce01 gives an exact byte
-         formula, tested against g001's two CRC-validated payloads with
-         DIFFERENT sub-type bytes - all four independent byte predictions
-         matched exactly:
-           payload[0] = record[8] + record[0xb] + 12   (a length/sub-type byte;
-                        record[0xb] is a per-message-type value, e.g. 1 for the
-                        FUN_de1b poll path)
-           payload[1] = 0xCC (constant)
-           payload[2] = 0x6E (constant, CRC-covered)
-           payload[3] = (record[8]&3)<<4 | record[9] | 0x0f   (record[9] was
-                        0x40 in one captured packet, 0x80 in the other - a
-                        candidate direction/type marker, NOT confirmed)
-           payload[4]     = _DAT_013e, LOW byte only (the high byte is never
-                             transmitted by this serializer)
-           payload[5:7]   = _DAT_0140, full 16-bit big-endian
-           payload[7]     = _DAT_0109, LOW byte only (high byte never sent)
-           payload[8:10]  = _DAT_010b, full 16-bit big-endian
-         This exactly explains the empirically-observed "swapped 3-byte node
-         ID" fields between poll and response (docs/rtl433.md "0c"): the
-         3-byte group (013e_lo + full 0140) in one packet swaps with (0109_lo +
-         full 010b) in the other - i.e. each side sends "my (013e,0140)" and
-         echoes back "your (0109,010b)", and the peer mirrors it. Consistent
-         with a correlation cookie / pairing handshake, not a physical reading.
-         Payload bytes [10:32) (before the CRC-16 trailer) are NOT yet mapped -
-         the assembly shows they come from a count-loop with computed/indirect
-         addressing that was traced structurally but not fully resolved
-         statically (likely more queued sub-messages, since the accounted
-         bytes don't fill 32). The decoder below exposes the bytes at [0],[3],
-         and the two RAM-word slots by their RAM-address origin (not a
-         physical unit - we don't know what they measure yet), alongside the
-         full raw payload for continued correlation on the unmapped tail.
-       The alarm code table (0x02 no-radio, 0x28 compressor, 0x29-0x2D MV1-5,
-       0x2F EEPROM error, ...) and the phase/status S-codes (see docs/eeprom-map.md
-       and docs/u2-serial-protocol.md) remain the best decode *targets* for the
-       unmapped tail. [U6] is still best resolved by a display-correlated
-       capture: change the level / force an alarm and watch which decoded
-       payload byte moves.
+Payload sub-fields (bytes 0-9 verified byte-exact against 2 real CRC-passing
+packets by reading the MC9S08 frame serializer FUN_ce01's raw assembly):
 
-This decoder anchors on the address, CRC-16-gates every frame, and emits the
-CRC-validated 32-byte payload as hex (field semantics [U6] not yet mapped, so
-the raw payload is still what captures are correlated against). It is ENABLED:
-tested end-to-end in rtl_433 on g001_868.2M_1000k.cu8, both packets of the
-exchange decode with mic=CRC, and an unrelated 433 MHz capture produces no
-false positives.
+    payload[0]    = record[8]+record[0xb]+12         (length/sub-type byte)
+    payload[3]    = (record[8]&3)<<4|record[9]|0x0f  (candidate type/dir marker)
+    payload[4]    = MC9S08 RAM 0x013e, low byte only (high byte never sent)
+    payload[5:7]  = MC9S08 RAM 0x0140, full 16-bit
+    payload[7]    = MC9S08 RAM 0x0109, low byte only
+    payload[8:10] = MC9S08 RAM 0x010b, full 16-bit
 
-Flex-decoder equivalent for a first capture pass. Tune ~150 kHz low so the
-carrier lands off the RTL-SDR DC spike; -Y minmax selects the FSK peak detector
-(otherwise the weak far-unit packet fragments). Best option - let the flex
-demodulator do the Manchester decode, so the payload comes out readable:
+Named by RAM origin, not a physical unit - meaning is unknown. Structurally
+these look like a poll/ack correlation cookie, not sensor telemetry: the
+MC9S08's response handler (FUN_caee) checks the incoming frame's matching
+fields for equality before accepting a reply, and packet-pair captures show
+(013e_lo + full 0140) in one packet swapping with (0109_lo + full 010b) in the
+other - i.e. each side sends "my (013e,0140)" and echoes "your (0109,010b)".
+
+Confirmed OFF the radio: CYCLE COUNTER (MC9S08 RAM 0x0607) and the PLANT
+STATUS source (RAM 0x0613/0x0614) - neither is radio'd out (also confirmed
+empirically: a 20 h capture spanning a real counter tick showed byte-identical
+heartbeat frames). Get those via the serial CODE interface instead
+(docs/u2-serial-protocol.md).
+
+Payload bytes [10:32) are NOT mapped - the assembly traces to a count-loop
+with computed/indirect addressing not fully resolved statically. Physical
+field semantics (level/temperature/phase/alarm) need either more firmware
+tracing or a display-correlated capture. The alarm code table
+(docs/eeprom-map.md) and phase/status S-codes (docs/u2-serial-protocol.md)
+are the decode targets once a byte offset is found.
+
+Status: ENABLED. CRC-16 gates every frame; tested end-to-end in rtl_433 on
+g001_868.2M_1000k.cu8 (both packets decode with mic=CRC) and an unrelated
+433 MHz capture produces zero false positives.
+
+Flex-decoder equivalent, for capturing without this C decoder:
   rtl_433 -f 868.20M -Y minmax \
     -X 'n=uclean1,m=FSK_MC_ZEROBIT,s=10,r=100,bits>=200,invert'
-FSK_MC_ZEROBIT is a demod-LEVEL Manchester slicer (decodes from pulse timing),
-so s=10 is the half-bit period and the output is the DECODED bytes (~326 bits,
-half of ~650). "invert" makes it match our raw 01->1 / 10->0 convention, so the
-fd 7a ba ba ba 83 header prints verbatim. Full recall (all 8 packets of a 4-event
-replay). Its phase lock assumes a leading zero bit, so a row may be off by one
-bit - just search for fd7a as this decoder does. This C decoder uses the same
-demod (FSK_PULSE_MANCHESTER_ZEROBIT), so the framework hands us the already
-Manchester-decoded bytes and we simply anchor on fd7a.
-NOTE the demod-level slicer is NOT the same as the "decode_mc" post-filter, which
-aborts at the first Manchester violation and only tries phase 0, so on these
-phase-offset, slightly-noisy packets it collapses to empty rows - that filter is
-unusable here.
-To instead see the RAW on-air bits (Manchester still encoded, decode by eye
-01->1/10->0), use FSK_PCM at the full 100 kbps line rate:
+Tune ~150 kHz low so the carrier clears the RTL-SDR DC spike; -Y minmax is
+required (the default detector fragments the weaker far-unit packet).
+FSK_MC_ZEROBIT is a demodulator-level Manchester slicer (decodes from pulse
+timing, unlike the decode_mc post-filter which aborts on the first violation
+and does not work on these phase-offset packets). "invert" matches our raw
+01->1/10->0 convention. For the raw (still Manchester-encoded) bit stream:
   rtl_433 -f 868.20M -Y minmax -X 'n=uclean1,m=FSK_PCM,s=10,l=10,r=100,bits>=400'
 */
 
