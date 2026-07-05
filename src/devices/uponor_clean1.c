@@ -81,15 +81,12 @@ STILL UNKNOWN (do not invent)
        does no *software* Manchester - MC9S08 FUN_ce01/FUN_8ec7 append raw bytes
        to a ring buffer at RAM 0x0253, and the 8051 relays them verbatim - so the
        Manchester is a radio/PHY-layer effect, not a firmware step.)
-       IMPLEMENTATION CAVEAT (why the decode logic below is NOT yet changed): the
-       framework's FSK_MC_ZEROBIT slicer presents the bits in a different
-       bit-order/alignment than probe_capture.py's FM-discriminator decode - e.g.
-       one packet shows the address as 0x57 0x57 0x57 0x57 (= bit-reversed 0xEA)
-       at a byte boundary, while the other still prints the old fd7a...83 anchor.
-       Reconciling that bit convention (so the C decoder can anchor on the address
-       and CRC-16-gate in the bitbuffer domain) is a focused follow-up; until it
-       is done and tested end-to-end in rtl_433, the decoder keeps the working
-       fd7a anchor and emits raw hex.
+       RESOLVED (implementation): rtl_433's own FSK_MC_ZEROBIT output was
+       reconciled against probe_capture.py's independent decode - both find
+       EAEAEAEA and pass CRC-16 on the SAME two captured packets, just at a
+       per-packet bit offset that bitbuffer_search already handles. The decoder
+       below anchors on the address and CRC-16-gates every frame; both packets
+       of g001_868.2M_1000k.cu8 decode with mic=CRC.
   [U4] There are two CRC-16s, and the trailer IS a CRC after all:
        1. nRF905 hardware CRC-16 over the pre-Manchester on-air address+payload
           (config CRC_EN=1/CRC_MODE=1). Verified + stripped by the radio, so not
@@ -123,16 +120,43 @@ STILL UNKNOWN (do not invent)
          pair, not raw sensor telemetry: FUN_caee (the response handler) checks
          the INCOMING frame's corresponding fields for equality against them
          (_DAT_0109==_DAT_0619, _DAT_010b==_DAT_061b, _DAT_013e==_DAT_061d,
-         _DAT_0140==_DAT_061f) before accepting the reply. That is consistent
-         with the empirically-observed "swapped 3-byte node ID" fields between
-         poll and response (docs/rtl433.md "0c") being a correlation cookie
-         rather than a physical measurement - though the exact RAM-word-to-
-         payload-byte-offset mapping is not proven (the byte order the 8051
-         relay actually transmits in has not been traced end to end).
+         _DAT_0140==_DAT_061f) before accepting the reply.
+       - BYTE OFFSETS NOW LOCATED (verified against real captures). Reading the
+         raw HCS08 assembly of the frame serializer FUN_ce01 gives an exact byte
+         formula, tested against g001's two CRC-validated payloads with
+         DIFFERENT sub-type bytes - all four independent byte predictions
+         matched exactly:
+           payload[0] = record[8] + record[0xb] + 12   (a length/sub-type byte;
+                        record[0xb] is a per-message-type value, e.g. 1 for the
+                        FUN_de1b poll path)
+           payload[1] = 0xCC (constant)
+           payload[2] = 0x6E (constant, CRC-covered)
+           payload[3] = (record[8]&3)<<4 | record[9] | 0x0f   (record[9] was
+                        0x40 in one captured packet, 0x80 in the other - a
+                        candidate direction/type marker, NOT confirmed)
+           payload[4]     = _DAT_013e, LOW byte only (the high byte is never
+                             transmitted by this serializer)
+           payload[5:7]   = _DAT_0140, full 16-bit big-endian
+           payload[7]     = _DAT_0109, LOW byte only (high byte never sent)
+           payload[8:10]  = _DAT_010b, full 16-bit big-endian
+         This exactly explains the empirically-observed "swapped 3-byte node
+         ID" fields between poll and response (docs/rtl433.md "0c"): the
+         3-byte group (013e_lo + full 0140) in one packet swaps with (0109_lo +
+         full 010b) in the other - i.e. each side sends "my (013e,0140)" and
+         echoes back "your (0109,010b)", and the peer mirrors it. Consistent
+         with a correlation cookie / pairing handshake, not a physical reading.
+         Payload bytes [10:32) (before the CRC-16 trailer) are NOT yet mapped -
+         the assembly shows they come from a count-loop with computed/indirect
+         addressing that was traced structurally but not fully resolved
+         statically (likely more queued sub-messages, since the accounted
+         bytes don't fill 32). The decoder below exposes the bytes at [0],[3],
+         and the two RAM-word slots by their RAM-address origin (not a
+         physical unit - we don't know what they measure yet), alongside the
+         full raw payload for continued correlation on the unmapped tail.
        The alarm code table (0x02 no-radio, 0x28 compressor, 0x29-0x2D MV1-5,
        0x2F EEPROM error, ...) and the phase/status S-codes (see docs/eeprom-map.md
-       and docs/u2-serial-protocol.md) remain the best decode *targets* once a
-       byte offset is found. [U6] is still best resolved by a display-correlated
+       and docs/u2-serial-protocol.md) remain the best decode *targets* for the
+       unmapped tail. [U6] is still best resolved by a display-correlated
        capture: change the level / force an alarm and watch which decoded
        payload byte moves.
 
@@ -182,6 +206,22 @@ static uint8_t const uclean1_addr[] = {0xea, 0xea, 0xea, 0xea};
 #define UCLEAN1_PAYLOAD_LEN  32
 #define UCLEAN1_CRC_LEN      2
 #define UCLEAN1_FRAME_LEN    (UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + UCLEAN1_CRC_LEN) // 38
+
+// Sub-field offsets within the 32-byte payload, verified against real captures
+// by reading the raw HCS08 assembly of the MC9S08 frame serializer FUN_ce01
+// (see the file header, [U6]). Byte-exact match on 4 independent predictions
+// across two differently-typed captured packets. Names are RAM-address-based
+// (where the byte comes from in the firmware), NOT a physical unit - we do not
+// yet know what these RAM words represent, only where they sit on the wire.
+#define UCLEAN1_OFF_HDR0     0  // record[8]+record[0xb]+12 (length/sub-type)
+#define UCLEAN1_OFF_HDR3     3  // (record[8]&3)<<4|record[9]|0x0f (candidate type/direction marker)
+#define UCLEAN1_OFF_013E_LO  4  // _DAT_013e, low byte only (high byte never sent)
+#define UCLEAN1_OFF_0140_HI  5  // _DAT_0140, high byte
+#define UCLEAN1_OFF_0140_LO  6  // _DAT_0140, low byte
+#define UCLEAN1_OFF_0109_LO  7  // _DAT_0109, low byte only (high byte never sent)
+#define UCLEAN1_OFF_010B_HI  8  // _DAT_010b, high byte
+#define UCLEAN1_OFF_010B_LO  9  // _DAT_010b, low byte
+// Bytes [10, 32) are NOT yet mapped - see the file header [U6].
 
 static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
@@ -245,16 +285,33 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         for (unsigned i = 0; i < UCLEAN1_ADDR_LEN; ++i)
             snprintf(id_str + i * 2, 3, "%02x", frame[i]);
 
-        // Payload byte semantics ([U6]) are not yet mapped, so emit the raw
-        // CRC-validated 32-byte payload as hex for correlation with the display.
+        // Payload byte semantics ([U6]) are only partly mapped, so emit the raw
+        // CRC-validated 32-byte payload as hex for correlation with the display,
+        // ALONGSIDE the sub-fields whose byte position is now verified (see the
+        // offsets above). The sub-fields are named after their MC9S08 RAM origin,
+        // not a physical unit - their real-world meaning is still unknown.
         char payload_str[UCLEAN1_PAYLOAD_LEN * 2 + 1];
         for (unsigned i = 0; i < UCLEAN1_PAYLOAD_LEN; ++i)
             snprintf(payload_str + i * 2, 3, "%02x", frame[UCLEAN1_ADDR_LEN + i]);
+
+        uint8_t const *payload   = &frame[UCLEAN1_ADDR_LEN];
+        int hdr0                 = payload[UCLEAN1_OFF_HDR0];
+        int hdr3                 = payload[UCLEAN1_OFF_HDR3];
+        int word_013e_lo         = payload[UCLEAN1_OFF_013E_LO];
+        int word_0140            = (payload[UCLEAN1_OFF_0140_HI] << 8) | payload[UCLEAN1_OFF_0140_LO];
+        int word_0109_lo         = payload[UCLEAN1_OFF_0109_LO];
+        int word_010b            = (payload[UCLEAN1_OFF_010B_HI] << 8) | payload[UCLEAN1_OFF_010B_LO];
 
         /* clang-format off */
         data_t *data = data_make(
                 "model",        "",             DATA_STRING, "Uponor-Clean-1",
                 "id",           "Address",      DATA_STRING, id_str,
+                "hdr0",         "Header byte 0", DATA_FORMAT, "0x%02x", DATA_INT, hdr0,
+                "hdr3",         "Header byte 3", DATA_FORMAT, "0x%02x", DATA_INT, hdr3,
+                "word_013e_lo", "RAM 0x013e (low byte)", DATA_INT, word_013e_lo,
+                "word_0140",    "RAM 0x0140",   DATA_INT,   word_0140,
+                "word_0109_lo", "RAM 0x0109 (low byte)", DATA_INT, word_0109_lo,
+                "word_010b",    "RAM 0x010b",   DATA_INT,   word_010b,
                 "payload",      "Payload",      DATA_STRING, payload_str,
                 "mic",          "Integrity",    DATA_STRING, "CRC",
                 NULL);
@@ -269,10 +326,17 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 static char const *const uponor_clean1_output_fields[] = {
         "model",
         "id",
+        "hdr0",
+        "hdr3",
+        "word_013e_lo",
+        "word_0140",
+        "word_0109_lo",
+        "word_010b",
         "payload",
         "mic",
-        // Real sensor fields go here once [U6] is resolved, e.g.:
-        // "level_pct", "temperature_C", "phase", "alarm", "pump_on",
+        // Real sensor fields (level/temperature/phase/alarm) go here once the
+        // physical meaning of the word_* fields above, and the unmapped tail
+        // (payload bytes 10-31), are resolved - see [U6] in the file header.
         NULL,
 };
 
