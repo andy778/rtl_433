@@ -35,35 +35,54 @@ CRC-16 passes):
 - The 8051 never computes payload content - it relays whatever the MC9S08
   sends it byte-for-byte (traced via the 8051's serial ISR at 0x029f).
 
-Payload sub-fields (bytes 0-9 verified byte-exact against 2 real CRC-passing
-packets by reading the MC9S08 frame serializer FUN_ce01's raw assembly):
+Payload layout (verified byte-exact against real CRC-passing packets by reading
+the MC9S08 frame serializer FUN_ce01's raw assembly, and confirmed on-air across
+poll / response / alarm frames):
 
-    payload[0]    = record[8]+record[0xb]+12         (length/sub-type byte)
-    payload[3]    = (record[8]&3)<<4|record[9]|0x0f  (candidate type/dir marker)
+    payload[0]    = record[8]+record[0xb]+12 = 12 + N   (N = message length)
+    payload[3]    = (record[8]&3)<<4|record[9]|0x0f     (flags + direction marker)
     payload[4]    = MC9S08 RAM 0x013e, low byte only (high byte never sent)
     payload[5:7]  = MC9S08 RAM 0x0140, full 16-bit
     payload[7]    = MC9S08 RAM 0x0109, low byte only
     payload[8:10] = MC9S08 RAM 0x010b, full 16-bit
+    payload[10]   = N, the message-body length (record[0xb])   <-- key
+    payload[11..10+N] = the N message bytes
+    payload[11+N .. 31] = STALE BUFFER, not data (see below)
 
-Named by RAM origin, not a physical unit - meaning is unknown. Structurally
-these look like a poll/ack correlation cookie, not sensor telemetry: the
-MC9S08's response handler (FUN_caee) checks the incoming frame's matching
-fields for equality before accepting a reply, and packet-pair captures show
-(013e_lo + full 0140) in one packet swapping with (0109_lo + full 010b) in the
-other - i.e. each side sends "my (013e,0140)" and echoes "your (0109,010b)".
+The 4 RAM words (013e/0140/0109/010b) are a poll/ack correlation cookie, not
+sensor telemetry: the response handler (FUN_caee) checks them for equality
+before accepting a reply, and packet pairs show (013e_lo + 0140) in one packet
+swapping with (0109_lo + 010b) in the other - each side sends "my (013e,0140)"
+and echoes "your (0109,010b)".
 
-Confirmed OFF the radio: CYCLE COUNTER (MC9S08 RAM 0x0607) and the PLANT
-STATUS source (RAM 0x0613/0x0614) - neither is radio'd out (also confirmed
-empirically: a 20 h capture spanning a real counter tick showed byte-identical
-heartbeat frames). Get those via the serial CODE interface instead
+payload[10] = N ties the whole frame together: hdr0 = 12 + N, and exactly N
+message bytes follow at payload[11]. Confirmed on three frame types from one
+reboot capture:
+
+    frame      hdr0  N  body (payload[11..])   meaning
+    response   0x0c  0  (none)                 ACK, no body
+    poll       0x0d  1  24                      heartbeat opcode
+    alarm      0x0e  2  20 00                   [type=0x20 status, state=0 OK]
+
+The alarm body is [type, state]. The 5 types map to the indoor info panel's 5
+symbols (firmware FUN_e372 sends all 5 at boot, FUN_e427/FUN_e0e5 on change):
+
+    0x20 status / OK LED    0x21 chemical low     0x22 high water
+    0x23 sludge reminder    0x26 device fault "!"
+
+state 0/1 = clear/active. See docs/ghidra/alarm_frames.c and docs/eeprom-map.md
+(type -> E-code). Only type 0x20 has been captured so far (green-LED idle); the
+other four need a capture started BEFORE power-on to catch the boot burst.
+
+Bytes payload[11+N .. 31] are STALE BUFFER, NOT data: U2 fills only N body bytes
+and radios the leftover buffer, so identical logical frames print different
+tails run-to-run (CRC still passes because U2 computes it over whatever it
+sends). Decode nothing past payload[10]+N.
+
+Confirmed OFF the radio: CYCLE COUNTER (RAM 0x0607) and PLANT STATUS
+(RAM 0x0613/0x0614) are not radio'd out (a 20 h capture over a real counter
+tick showed byte-identical heartbeats). Get those via the serial CODE interface
 (docs/u2-serial-protocol.md).
-
-Payload bytes [10:32) are NOT mapped - the assembly traces to a count-loop
-with computed/indirect addressing not fully resolved statically. Physical
-field semantics (level/temperature/phase/alarm) need either more firmware
-tracing or a display-correlated capture. The alarm code table
-(docs/eeprom-map.md) and phase/status S-codes (docs/u2-serial-protocol.md)
-are the decode targets once a byte offset is found.
 
 Status: ENABLED. CRC-16 gates every frame; tested end-to-end in rtl_433 on
 g001_868.2M_1000k.cu8 (both packets decode with mic=CRC) and an unrelated
@@ -112,7 +131,10 @@ static uint8_t const uclean1_addr[] = {0xea, 0xea, 0xea, 0xea};
 #define UCLEAN1_OFF_0109_LO  7  // _DAT_0109, low byte only (high byte never sent)
 #define UCLEAN1_OFF_010B_HI  8  // _DAT_010b, high byte
 #define UCLEAN1_OFF_010B_LO  9  // _DAT_010b, low byte
-// Bytes [10, 32) are NOT yet mapped - see the file header [U6].
+#define UCLEAN1_OFF_MSGLEN   10 // N = message-body length (record[0xb]); hdr0 = 12+N
+#define UCLEAN1_OFF_MSGTYPE  11 // message body byte 0 = type (0x20..0x26 alarm, 0x24 heartbeat)
+#define UCLEAN1_OFF_MSGSTATE 12 // message body byte 1 = state (0/1) for alarm frames (N>=2)
+// Bytes [11+N, 32) are stale buffer, not data - see the file header.
 
 static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
@@ -193,10 +215,40 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         int word_0109_lo         = payload[UCLEAN1_OFF_0109_LO];
         int word_010b            = (payload[UCLEAN1_OFF_010B_HI] << 8) | payload[UCLEAN1_OFF_010B_LO];
 
+        // Direction marker = record[9], the top 2 bits of hdr3 (firmware: hdr3 =
+        // (record[8]&3)<<4 | record[9] | 0x0f). 0x40 = poll (control cabinet ->
+        // info panel), 0x80 = response (panel echoes the poll's ID pair back as
+        // an ACK). Confirmed on the two-packet g001 exchange (poll hdr3=0x4f,
+        // response hdr3=0x8f). The two packets otherwise carry the same fields;
+        // the response just swaps the two 16-bit ID pairs (source/dest handshake).
+        char const *role = (hdr3 & 0x80) ? "response"
+                         : (hdr3 & 0x40) ? "poll"
+                         : "?";
+
+        // Message body: payload[10] = N, then N bytes at payload[11]. For alarm
+        // frames (N>=2) the body is [type, state]; type maps to one of the info
+        // panel's 5 symbols. hdr0 = 12+N is the same N, so they cross-check.
+        int msg_len   = payload[UCLEAN1_OFF_MSGLEN];
+        int msg_type  = payload[UCLEAN1_OFF_MSGTYPE];  // valid when msg_len >= 1
+        int msg_state = payload[UCLEAN1_OFF_MSGSTATE]; // valid when msg_len >= 2
+        char const *msg_name =
+                  msg_type == 0x20 ? "status"
+                : msg_type == 0x21 ? "chemical_low"
+                : msg_type == 0x22 ? "high_water"
+                : msg_type == 0x23 ? "sludge_reminder"
+                : msg_type == 0x26 ? "device_fault"
+                : msg_type == 0x24 ? "heartbeat"
+                : "?";
+
         /* clang-format off */
         data_t *data = data_make(
                 "model",        "",             DATA_STRING, "Uponor-Clean-1",
                 "id",           "Address",      DATA_STRING, id_str,
+                "role",         "Role",         DATA_STRING, role,
+                "msg_len",      "Msg length",   DATA_INT,    msg_len,
+                "msg_type",     "Msg type",     DATA_COND,   msg_len >= 1, DATA_FORMAT, "0x%02x", DATA_INT, msg_type,
+                "msg_name",     "Msg name",     DATA_COND,   msg_len >= 1, DATA_STRING, msg_name,
+                "msg_state",    "Msg state",    DATA_COND,   msg_len >= 2, DATA_INT,    msg_state,
                 "hdr0",         "Header byte 0", DATA_FORMAT, "0x%02x", DATA_INT, hdr0,
                 "hdr3",         "Header byte 3", DATA_FORMAT, "0x%02x", DATA_INT, hdr3,
                 "word_013e_lo", "RAM 0x013e (low byte)", DATA_INT, word_013e_lo,
@@ -217,6 +269,11 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 static char const *const uponor_clean1_output_fields[] = {
         "model",
         "id",
+        "role",
+        "msg_len",
+        "msg_type",
+        "msg_name",
+        "msg_state",
         "hdr0",
         "hdr3",
         "word_013e_lo",
