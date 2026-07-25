@@ -48,7 +48,9 @@ panel symbols; 4 confirmed on air in a boot burst, all clear:
     0x23 sludge_reminder   0x26 device_fault   (0x24 = heartbeat, not an alarm)
 
 Node IDs are stable per device (outer 80 0D 6E, panel C0 23 4B) - a poll/ack
-cookie: each side sends its own and echoes the other's.
+cookie: each side sends its own and echoes the other's. The sender's node ID
+is reported as "id", because the nRF905 address is a firmware constant and so
+is the same on every unit; it is reported separately as "address".
 
 NOT on the radio: the cycle counter and treatment-phase code (firmware-confirmed;
 a 20 h capture over a counter tick showed identical heartbeats). Read those over
@@ -112,7 +114,8 @@ static void bytes_to_hex(char *dst, uint8_t const *src, unsigned len)
 
 static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
-    int ret = DECODE_ABORT_EARLY;
+    int ret    = DECODE_ABORT_EARLY;
+    int events = 0;
 
     for (unsigned row = 0; row < bitbuffer->num_rows; ++row) {
         unsigned row_bits = bitbuffer->bits_per_row[row];
@@ -167,8 +170,13 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
         uint8_t const *payload = &frame[UCLEAN1_ADDR_LEN];
 
-        char id_str[UCLEAN1_ADDR_LEN * 2 + 1];
-        bytes_to_hex(id_str, frame, UCLEAN1_ADDR_LEN);
+        // The nRF905 address is a hardcoded constant in the firmware image, so
+        // it is identical on every unit and useless as an identifier. The
+        // sender's 3-byte node ID is the per-device value (stable across
+        // captures days apart), so that is what "id" reports; the constant is
+        // still emitted as "address" for completeness.
+        char addr_str[UCLEAN1_ADDR_LEN * 2 + 1];
+        bytes_to_hex(addr_str, frame, UCLEAN1_ADDR_LEN);
 
         char node_src[UCLEAN1_NODE_LEN * 2 + 1];
         char node_dst[UCLEAN1_NODE_LEN * 2 + 1];
@@ -186,7 +194,17 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         // Message body: payload[10] = N, then N bytes at payload[11]. For alarm
         // frames (N >= 2) the body is [type, state]; type is one of the 5 panel
         // symbols.
-        int msg_len   = payload[UCLEAN1_OFF_MSGLEN];
+        int msg_len = payload[UCLEAN1_OFF_MSGLEN];
+
+        // Second gate: frame[0] restates the length as 12 + N, so a mismatch
+        // means a CRC-valid but misaligned/misparsed frame. Also bounds N to
+        // the buffer.
+        if (payload[0] != 12 + msg_len || UCLEAN1_OFF_MSGTYPE + msg_len > UCLEAN1_PAYLOAD_LEN) {
+            decoder_log(decoder, 2, __func__, "msg_len inconsistent with header");
+            ret = DECODE_ABORT_EARLY;
+            continue;
+        }
+
         int msg_type  = payload[UCLEAN1_OFF_MSGTYPE];  // valid when msg_len >= 1
         int msg_state = payload[UCLEAN1_OFF_MSGSTATE]; // valid when msg_len >= 2
         char const *msg_name =
@@ -201,9 +219,9 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         /* clang-format off */
         data_t *data = data_make(
                 "model",     "",           DATA_STRING, "Uponor-Clean-1",
-                "id",        "Address",    DATA_STRING, id_str,
+                "id",        "Node ID",    DATA_STRING, node_src,
+                "address",   "Address",    DATA_STRING, addr_str,
                 "role",      "Role",       DATA_STRING, role,
-                "node_src",  "Node src",   DATA_STRING, node_src,
                 "node_dst",  "Node dst",   DATA_STRING, node_dst,
                 "msg_len",   "Msg length", DATA_INT,    msg_len,
                 "msg_type",  "Msg type",   DATA_COND, msg_len >= 1, DATA_FORMAT, "0x%02x", DATA_INT, msg_type,
@@ -214,17 +232,19 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
                 NULL);
         /* clang-format on */
         decoder_output_data(decoder, data);
-        return 1;
+        events++;
     }
 
-    return ret;
+    // A single exchange can land as two rows (poll + response) in one buffer;
+    // decode every one rather than stopping at the first.
+    return events ? events : ret;
 }
 
 static char const *const uponor_clean1_output_fields[] = {
         "model",
         "id",
+        "address",
         "role",
-        "node_src",
         "node_dst",
         "msg_len",
         "msg_type",
