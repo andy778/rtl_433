@@ -48,11 +48,33 @@ panel symbols; 4 confirmed on air in a boot burst, all clear:
     0x23 sludge_reminder   0x26 device_fault   (0x24 = heartbeat, not an alarm)
 
 Node IDs are stable per device (outer 80 0D 6E, panel C0 23 4B) - a poll/ack
-cookie: each side sends its own and echoes the other's.
+cookie: each side sends its own and echoes the other's. The sender's node ID
+is reported as "id", because the nRF905 address is a firmware constant and so
+is the same on every unit; it is reported separately as "address".
 
 NOT on the radio: the cycle counter and treatment-phase code (firmware-confirmed;
 a 20 h capture over a counter tick showed identical heartbeats). Read those over
 the serial CODE interface instead (docs/u2-serial-protocol.md).
+
+Example received frames (boot-burst capture, power-cycling the outer unit):
+
+    heartbeat:  0dcc6e4f800d6ec0234b0124b9c635bd3ff2f4b8abdc5effd177bff72fff6fef
+    status:     0ecc6e4f800d6ec0234b0220006566bd3ff2f4baabde5fbfd17fbff72fff6fef
+    chem_low:   0ecc6e4f800d6ec0234b0221005657bd3ff2f4baabde5fbfd17fbff72fff6fef
+    high_water: 0ecc6e4f800d6ec0234b0222000304bd3ff2f4baabde5fbfd17fbff72fff6fef
+
+Byte-by-byte, the "status" frame above:
+
+    0e cc 6e 4f 80 0d 6e c0 23 4b 02 20 00 65 66 bd ...
+    |  \___/  |  \______/  \______/  |  \___/  \_______________________/
+    |    |    |     |         |      |    |             `-- stale buffer, not data
+    |    |    |     |         |      |    `-- body: type=0x20 (status), state=0x00 (OK)
+    |    |    |     |         |      `-- N = 2 (body length)
+    |    |    |     |         `-- node_dst = C0 23 4B (indoor panel)
+    |    |    |     `-- node_src = 80 0D 6E (outer unit)
+    |    |    `-- dir = 0x40 | flags -> "poll"
+    |    `-- constant tag CC 6E
+    `-- hdr0 = 12 + N = 0x0e
 
 Flex-decoder equivalent (no C decoder):
   rtl_433 -f 868.20M -Y minmax \
@@ -70,19 +92,19 @@ required (the default detector fragments the weaker far-unit packet).
 // Frame = [ADDRESS 4][PAYLOAD 32][CRC-16 2], anchored on the nRF905 address.
 static uint8_t const uclean1_addr[] = {0xea, 0xea, 0xea, 0xea};
 
-#define UCLEAN1_ADDR_LEN     4
-#define UCLEAN1_PAYLOAD_LEN  32
-#define UCLEAN1_CRC_LEN      2
-#define UCLEAN1_FRAME_LEN    (UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + UCLEAN1_CRC_LEN) // 38
-#define UCLEAN1_NODE_LEN     3
+#define UCLEAN1_ADDR_LEN    4
+#define UCLEAN1_PAYLOAD_LEN 32
+#define UCLEAN1_CRC_LEN     2
+#define UCLEAN1_FRAME_LEN   (UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + UCLEAN1_CRC_LEN) // 38
+#define UCLEAN1_NODE_LEN    3
 
 // Payload offsets (see the frame map in the file header).
-#define UCLEAN1_OFF_DIR       3  // 0x40 poll / 0x80 response
-#define UCLEAN1_OFF_NODE_SRC  4  // sender node ID, 3 bytes
-#define UCLEAN1_OFF_NODE_DST  7  // recipient node ID, 3 bytes (echoed)
-#define UCLEAN1_OFF_MSGLEN   10  // N = message-body length; frame[0] = 12 + N
-#define UCLEAN1_OFF_MSGTYPE  11  // body[0] = type (0x20-0x26 alarm, 0x24 heartbeat)
-#define UCLEAN1_OFF_MSGSTATE 12  // body[1] = state 0/1 (alarm frames, N >= 2)
+#define UCLEAN1_OFF_DIR      3  // 0x40 poll / 0x80 response
+#define UCLEAN1_OFF_NODE_SRC 4  // sender node ID, 3 bytes
+#define UCLEAN1_OFF_NODE_DST 7  // recipient node ID, 3 bytes (echoed)
+#define UCLEAN1_OFF_MSGLEN   10 // N = message-body length; frame[0] = 12 + N
+#define UCLEAN1_OFF_MSGTYPE  11 // body[0] = type (0x20-0x26 alarm, 0x24 heartbeat)
+#define UCLEAN1_OFF_MSGSTATE 12 // body[1] = state 0/1 (alarm frames, N >= 2)
 
 static void bytes_to_hex(char *dst, uint8_t const *src, unsigned len)
 {
@@ -92,7 +114,8 @@ static void bytes_to_hex(char *dst, uint8_t const *src, unsigned len)
 
 static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 {
-    int ret = DECODE_ABORT_EARLY;
+    int ret    = DECODE_ABORT_EARLY;
+    int events = 0;
 
     for (unsigned row = 0; row < bitbuffer->num_rows; ++row) {
         unsigned row_bits = bitbuffer->bits_per_row[row];
@@ -113,7 +136,7 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         if (pos >= row_bits) {
             bitbuffer_invert(bitbuffer);
             inverted = 1;
-            pos = bitbuffer_search(bitbuffer, row, 0,
+            pos      = bitbuffer_search(bitbuffer, row, 0,
                     uclean1_addr, sizeof(uclean1_addr) * 8);
         }
         if (pos >= row_bits) {
@@ -138,8 +161,7 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
         // nRF905 hardware CRC-16 over ADDRESS+PAYLOAD. Gates the decode.
         uint16_t crc_calc = crc16(frame, UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN, 0x1021, 0xffff);
-        uint16_t crc_recv = (frame[UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN] << 8)
-                | frame[UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + 1];
+        uint16_t crc_recv = (frame[UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN] << 8) | frame[UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + 1];
         if (crc_calc != crc_recv) {
             decoder_log(decoder, 2, __func__, "CRC-16 mismatch");
             ret = DECODE_FAIL_MIC;
@@ -148,8 +170,13 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
 
         uint8_t const *payload = &frame[UCLEAN1_ADDR_LEN];
 
-        char id_str[UCLEAN1_ADDR_LEN * 2 + 1];
-        bytes_to_hex(id_str, frame, UCLEAN1_ADDR_LEN);
+        // The nRF905 address is a hardcoded constant in the firmware image, so
+        // it is identical on every unit and useless as an identifier. The
+        // sender's 3-byte node ID is the per-device value (stable across
+        // captures days apart), so that is what "id" reports; the constant is
+        // still emitted as "address" for completeness.
+        char addr_str[UCLEAN1_ADDR_LEN * 2 + 1];
+        bytes_to_hex(addr_str, frame, UCLEAN1_ADDR_LEN);
 
         char node_src[UCLEAN1_NODE_LEN * 2 + 1];
         char node_dst[UCLEAN1_NODE_LEN * 2 + 1];
@@ -159,32 +186,42 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         char payload_str[UCLEAN1_PAYLOAD_LEN * 2 + 1];
         bytes_to_hex(payload_str, payload, UCLEAN1_PAYLOAD_LEN);
 
-        int dir = payload[UCLEAN1_OFF_DIR];
-        char const *role = (dir & 0x80) ? "response"
-                         : (dir & 0x40) ? "poll"
-                         : "?";
+        int dir          = payload[UCLEAN1_OFF_DIR];
+        char const *role = (dir & 0x80)   ? "response"
+                           : (dir & 0x40) ? "poll"
+                                          : "?";
 
         // Message body: payload[10] = N, then N bytes at payload[11]. For alarm
         // frames (N >= 2) the body is [type, state]; type is one of the 5 panel
         // symbols.
-        int msg_len   = payload[UCLEAN1_OFF_MSGLEN];
+        int msg_len = payload[UCLEAN1_OFF_MSGLEN];
+
+        // Second gate: frame[0] restates the length as 12 + N, so a mismatch
+        // means a CRC-valid but misaligned/misparsed frame. Also bounds N to
+        // the buffer.
+        if (payload[0] != 12 + msg_len || UCLEAN1_OFF_MSGTYPE + msg_len > UCLEAN1_PAYLOAD_LEN) {
+            decoder_log(decoder, 2, __func__, "msg_len inconsistent with header");
+            ret = DECODE_ABORT_EARLY;
+            continue;
+        }
+
         int msg_type  = payload[UCLEAN1_OFF_MSGTYPE];  // valid when msg_len >= 1
         int msg_state = payload[UCLEAN1_OFF_MSGSTATE]; // valid when msg_len >= 2
         char const *msg_name =
-                  msg_type == 0x20 ? "status"
+                msg_type == 0x20   ? "status"
                 : msg_type == 0x21 ? "chemical_low"
                 : msg_type == 0x22 ? "high_water"
                 : msg_type == 0x23 ? "sludge_reminder"
                 : msg_type == 0x26 ? "device_fault"
                 : msg_type == 0x24 ? "heartbeat"
-                : "?";
+                                   : "?";
 
         /* clang-format off */
         data_t *data = data_make(
                 "model",     "",           DATA_STRING, "Uponor-Clean-1",
-                "id",        "Address",    DATA_STRING, id_str,
+                "id",        "Node ID",    DATA_STRING, node_src,
+                "address",   "Address",    DATA_STRING, addr_str,
                 "role",      "Role",       DATA_STRING, role,
-                "node_src",  "Node src",   DATA_STRING, node_src,
                 "node_dst",  "Node dst",   DATA_STRING, node_dst,
                 "msg_len",   "Msg length", DATA_INT,    msg_len,
                 "msg_type",  "Msg type",   DATA_COND, msg_len >= 1, DATA_FORMAT, "0x%02x", DATA_INT, msg_type,
@@ -195,17 +232,19 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
                 NULL);
         /* clang-format on */
         decoder_output_data(decoder, data);
-        return 1;
+        events++;
     }
 
-    return ret;
+    // A single exchange can land as two rows (poll + response) in one buffer;
+    // decode every one rather than stopping at the first.
+    return events ? events : ret;
 }
 
 static char const *const uponor_clean1_output_fields[] = {
         "model",
         "id",
+        "address",
         "role",
-        "node_src",
         "node_dst",
         "msg_len",
         "msg_type",
@@ -220,7 +259,7 @@ static char const *const uponor_clean1_output_fields[] = {
 // guarantees a transition at least every 2 half-bits, so ~100 us is safe and
 // still splits the two packets of an exchange (~19 ms apart) into separate rows.
 r_device const uponor_clean1 = {
-        .name        = "Uponor Clean 1 wastewater unit (needs -f 868.2M)",
+        .name        = "Uponor Clean 1 wastewater unit",
         .modulation  = FSK_PULSE_MANCHESTER_ZEROBIT,
         .short_width = UCLEAN1_BIT_US,
         .long_width  = UCLEAN1_BIT_US,
