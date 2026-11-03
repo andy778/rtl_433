@@ -445,6 +445,7 @@ add_library(r_433 STATIC
     devices/twogig_key2e.c
     devices/typhur_sync_gold.c
     devices/universalfanctrl.c
+    devices/uponor_clean1.c
     devices/vaillant_vrt340f.c
     devices/vauno_en8822c.c
     devices/vevor_7in1.c

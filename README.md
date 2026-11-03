@@ -480,6 +480,7 @@ See [CONTRIBUTING.md](./docs/CONTRIBUTING.md).
     [384]  Bresser SmartHome Garden soil moisture and water timer valve (Baldr Homgar, RainPoint)
     [385]* Neptune R900 BCD flow meters
     [386]  Olympia Protect 9571 alarm system sensors
+    [387]  Uponor Clean 1 wastewater unit (-f 868.05M -s 1000k)
 
 * Disabled by default, use -R n or a conf file to enable
 
