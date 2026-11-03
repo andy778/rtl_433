@@ -22,35 +22,49 @@ Frame (confirmed from firmware and live captures):
 
     [preamble] [address EA EA EA EA, 4B] [payload 32B] [CRC-16 2B]
 
-- 100 kbps, Manchester-coded on air (a PHY effect; neither firmware does
-  Manchester in software).
+- 50 kbps data, Manchester-coded on air as 100 kchip/s (a PHY effect; neither
+  firmware does Manchester in software).
 - Channel 117 = 868.2 MHz.
 - CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over address+payload,
-  big-endian trailer. Gates every decode.
+  big-endian trailer (the nRF905 hardware CRC). Gates every decode.
+- A second, application-layer CRC-16/CCITT-FALSE sits inside the payload, right
+  after the message body (see below). It is checked as well.
 
 The payload is a small messaging protocol, not analog telemetry - the panel has
 only 5 alarm symbols + an OK/status LED, and that is all the radio carries:
 
-    [0]         12 + N       frame length
-    [1..2]      CC 6E        constant tag
-    [3]         dir | flags  0x40 poll (outer->panel), 0x80 response (panel ACK)
-    [4..6]      node_src     sender's 3-byte node ID
-    [7..9]      node_dst     recipient's 3-byte node ID (echoed in the ACK)
-    [10]        N            message-body length
-    [11..10+N]  body         N=0 ACK, N=1 heartbeat (0x24), N=2 alarm [type,state]
-    [11+N..31]  stale        leftover TX buffer, NOT data (varies run-to-run;
-                             CRC still passes - U2 CRCs whatever it sends)
+    [0]          12 + N      length: counts bytes [1] .. [12+N] (tag .. CRC)
+    [1..2]       CC 6E       constant tag
+    [3]          ctrl        bits 7-6: 0x40 message, 0x80 ACK; bits 5-4: number
+                             of extra bytes after the IDs (unused, 0); bits 3-0
+                             always 1111 when sent => 0x4F message, 0x8F ACK
+    [4..6]       node_dst    recipient's 3-byte node ID
+    [7..9]       node_src    sender's 3-byte node ID (an ACK swaps src and dst)
+    [10]         N           message-body length
+    [11..10+N]   body        N=0 ACK, N=1 heartbeat (0x24), N=2 alarm [type,state]
+    [11+N..12+N] crc         CRC-16/CCITT-FALSE (init 0xFFFF), big-endian, over
+                             bytes [2] .. [10+N] (the CC tag byte is not covered)
+    [13+N..31]   stale       leftover TX buffer, NOT data (varies run-to-run;
+                             both CRCs still pass)
 
-Alarm body = [type, state], state 0/1 = clear/active. The 5 types are the 5
-panel symbols; 4 confirmed on air in a boot burst, all clear:
+Alarm body = [type, state], state 0/1 = clear/active. Which alarms drive each
+type, from the U2 senders (FUN_e0e5 sends on every change, FUN_e427 resends all
+on request, FUN_e372 sends all five as clear at boot):
 
-    0x20 status/OK   0x21 chemical_low   0x22 high_water
-    0x23 sludge_reminder   0x26 device_fault   (0x24 = heartbeat, not an alarm)
+    0x20 chemical_low      E021
+    0x21 high_water        E031 tank, E032 outlet, E033 pump station
+    0x22 device_fault      E040-E045 compressor / MV1-MV5, E047 EEPROM error
+    0x23 sludge_reminder   E051
+    0x26 gsm_fault         E012 (GSM modem / SIM fault)
 
-Node IDs are stable per device (outer 80 0D 6E, panel C0 23 4B) - a poll/ack
-cookie: each side sends its own and echoes the other's. The sender's node ID
-is reported as "id", because the nRF905 address is a firmware constant and so
-is the same on every unit; it is reported separately as "address".
+0x24 is the heartbeat, not an alarm. E011 (no radio link) is not sent.
+0x20-0x23 have been seen on air in a boot burst, all clear; 0x26 and any
+state=1 frame have not been captured yet.
+
+Node IDs are stable per device (outer unit C0 23 4B, indoor panel 80 0D 6E).
+The first ID in a frame is the recipient, the second the sender. The sender's
+node ID is reported as "id", because the nRF905 address is a firmware constant
+and so is the same on every unit; it is reported separately as "address".
 
 NOT on the radio: the cycle counter and treatment-phase code (firmware-confirmed;
 a 20 h capture over a counter tick showed identical heartbeats). Read those over
@@ -59,20 +73,21 @@ the serial CODE interface instead (docs/u2-serial-protocol.md).
 Example received frames (boot-burst capture, power-cycling the outer unit):
 
     heartbeat:  0dcc6e4f800d6ec0234b0124b9c635bd3ff2f4b8abdc5effd177bff72fff6fef
-    status:     0ecc6e4f800d6ec0234b0220006566bd3ff2f4baabde5fbfd17fbff72fff6fef
-    chem_low:   0ecc6e4f800d6ec0234b0221005657bd3ff2f4baabde5fbfd17fbff72fff6fef
-    high_water: 0ecc6e4f800d6ec0234b0222000304bd3ff2f4baabde5fbfd17fbff72fff6fef
+    chem_low:   0ecc6e4f800d6ec0234b0220006566bd3ff2f4baabde5fbfd17fbff72fff6fef
+    high_water: 0ecc6e4f800d6ec0234b0221005657bd3ff2f4baabde5fbfd17fbff72fff6fef
+    dev_fault:  0ecc6e4f800d6ec0234b0222000304bd3ff2f4baabde5fbfd17fbff72fff6fef
 
-Byte-by-byte, the "status" frame above:
+Byte-by-byte, the "chem_low" frame above:
 
     0e cc 6e 4f 80 0d 6e c0 23 4b 02 20 00 65 66 bd ...
-    |  \___/  |  \______/  \______/  |  \___/  \_______________________/
-    |    |    |     |         |      |    |             `-- stale buffer, not data
-    |    |    |     |         |      |    `-- body: type=0x20 (status), state=0x00 (OK)
-    |    |    |     |         |      `-- N = 2 (body length)
-    |    |    |     |         `-- node_dst = C0 23 4B (indoor panel)
-    |    |    |     `-- node_src = 80 0D 6E (outer unit)
-    |    |    `-- dir = 0x40 | flags -> "poll"
+    |  \___/ |  \______/ \______/ |  \___/ \___/ \________/
+    |    |   |     |        |     |    |     |        `-- stale buffer, not data
+    |    |   |     |        |     |    |     `-- app CRC over payload[2..12] = 0x6566
+    |    |   |     |        |     |    `-- body: type=0x20 (chemical_low), state=0x00 (clear)
+    |    |   |     |        |     `-- N = 2 (body length)
+    |    |   |     |        `-- node_src = C0 23 4B (outer unit)
+    |    |   |     `-- node_dst = 80 0D 6E (indoor panel)
+    |    |   `-- ctrl = 0x4F -> message (0x8F would be an ACK)
     |    `-- constant tag CC 6E
     `-- hdr0 = 12 + N = 0x0e
 
@@ -97,14 +112,16 @@ static uint8_t const uclean1_addr[] = {0xea, 0xea, 0xea, 0xea};
 #define UCLEAN1_CRC_LEN     2
 #define UCLEAN1_FRAME_LEN   (UCLEAN1_ADDR_LEN + UCLEAN1_PAYLOAD_LEN + UCLEAN1_CRC_LEN) // 38
 #define UCLEAN1_NODE_LEN    3
+#define UCLEAN1_APP_CRC_LEN 2
 
 // Payload offsets (see the frame map in the file header).
-#define UCLEAN1_OFF_DIR      3  // 0x40 poll / 0x80 response
-#define UCLEAN1_OFF_NODE_SRC 4  // sender node ID, 3 bytes
-#define UCLEAN1_OFF_NODE_DST 7  // recipient node ID, 3 bytes (echoed)
-#define UCLEAN1_OFF_MSGLEN   10 // N = message-body length; frame[0] = 12 + N
+#define UCLEAN1_OFF_DIR      3  // ctrl: 0x4F message / 0x8F ACK
+#define UCLEAN1_OFF_NODE_DST 4  // recipient node ID, 3 bytes
+#define UCLEAN1_OFF_NODE_SRC 7  // sender node ID, 3 bytes
+#define UCLEAN1_OFF_MSGLEN   10 // N = message-body length; payload[0] = 12 + N
 #define UCLEAN1_OFF_MSGTYPE  11 // body[0] = type (0x20-0x26 alarm, 0x24 heartbeat)
 #define UCLEAN1_OFF_MSGSTATE 12 // body[1] = state 0/1 (alarm frames, N >= 2)
+#define UCLEAN1_OFF_CRC_FROM 2  // application CRC covers payload[2] .. payload[10+N]
 
 static void bytes_to_hex(char *dst, uint8_t const *src, unsigned len)
 {
@@ -183,36 +200,51 @@ static int uponor_clean1_decode(r_device *decoder, bitbuffer_t *bitbuffer)
         bytes_to_hex(node_src, payload + UCLEAN1_OFF_NODE_SRC, UCLEAN1_NODE_LEN);
         bytes_to_hex(node_dst, payload + UCLEAN1_OFF_NODE_DST, UCLEAN1_NODE_LEN);
 
-        char payload_str[UCLEAN1_PAYLOAD_LEN * 2 + 1];
-        bytes_to_hex(payload_str, payload, UCLEAN1_PAYLOAD_LEN);
-
         int dir          = payload[UCLEAN1_OFF_DIR];
         char const *role = (dir & 0x80)   ? "response"
                            : (dir & 0x40) ? "poll"
                                           : "?";
 
         // Message body: payload[10] = N, then N bytes at payload[11]. For alarm
-        // frames (N >= 2) the body is [type, state]; type is one of the 5 panel
-        // symbols.
+        // frames (N >= 2) the body is [type, state]; type is one of the 5 alarm
+        // groups in the file header.
         int msg_len = payload[UCLEAN1_OFF_MSGLEN];
 
-        // Second gate: frame[0] restates the length as 12 + N, so a mismatch
-        // means a CRC-valid but misaligned/misparsed frame. Also bounds N to
-        // the buffer.
-        if (payload[0] != 12 + msg_len || UCLEAN1_OFF_MSGTYPE + msg_len > UCLEAN1_PAYLOAD_LEN) {
+        // Second gate: payload[0] restates the length as 12 + N, so a mismatch
+        // means a CRC-valid but misaligned/misparsed frame. Also bounds N so
+        // that the body and the application CRC fit inside the payload.
+        if (payload[0] != 12 + msg_len || UCLEAN1_OFF_MSGTYPE + msg_len + UCLEAN1_APP_CRC_LEN > UCLEAN1_PAYLOAD_LEN) {
             decoder_log(decoder, 2, __func__, "msg_len inconsistent with header");
-            ret = DECODE_ABORT_EARLY;
+            ret = DECODE_FAIL_SANITY;
             continue;
         }
+
+        // Third gate: the application-layer CRC-16/CCITT-FALSE the unit appends
+        // right after the body, covering payload[2] .. payload[10+N].
+        unsigned app_crc_pos  = UCLEAN1_OFF_MSGTYPE + msg_len;
+        uint16_t app_crc_calc = crc16(&payload[UCLEAN1_OFF_CRC_FROM],
+                app_crc_pos - UCLEAN1_OFF_CRC_FROM, 0x1021, 0xffff);
+        uint16_t app_crc_recv = (payload[app_crc_pos] << 8) | payload[app_crc_pos + 1];
+        if (app_crc_calc != app_crc_recv) {
+            decoder_log(decoder, 2, __func__, "application CRC-16 mismatch");
+            ret = DECODE_FAIL_MIC;
+            continue;
+        }
+
+        // Report the message part only: whatever follows the application CRC
+        // is the stale TX buffer, which differs from frame to frame.
+        unsigned payload_len = app_crc_pos + UCLEAN1_APP_CRC_LEN;
+        char payload_str[UCLEAN1_PAYLOAD_LEN * 2 + 1];
+        bytes_to_hex(payload_str, payload, payload_len);
 
         int msg_type  = payload[UCLEAN1_OFF_MSGTYPE];  // valid when msg_len >= 1
         int msg_state = payload[UCLEAN1_OFF_MSGSTATE]; // valid when msg_len >= 2
         char const *msg_name =
-                msg_type == 0x20   ? "status"
-                : msg_type == 0x21 ? "chemical_low"
-                : msg_type == 0x22 ? "high_water"
+                msg_type == 0x20   ? "chemical_low"
+                : msg_type == 0x21 ? "high_water"
+                : msg_type == 0x22 ? "device_fault"
                 : msg_type == 0x23 ? "sludge_reminder"
-                : msg_type == 0x26 ? "device_fault"
+                : msg_type == 0x26 ? "gsm_fault"
                 : msg_type == 0x24 ? "heartbeat"
                                    : "?";
 
